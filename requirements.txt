@@ -1,0 +1,8 @@
+hidapi==0.15.0
+vgamepad==0.1.0
+pystray==0.19.5
+pillow==12.3.0
+SoundCard==0.4.6
+numpy==2.5.3
+comtypes==1.4.17
+sv_ttk==2.6.1

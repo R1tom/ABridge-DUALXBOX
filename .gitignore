@@ -1,0 +1,7 @@
+# personal settings (device ids, game paths) - the app creates its own on first run
+config.json
+venv/
+__pycache__/
+backup-*/
+*.bak*
+*.log
