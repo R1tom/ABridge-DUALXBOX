@@ -340,6 +340,21 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
+LOG_PATH = os.path.join(APP_DIR, "padbridge.log")
+
+
+def log_error(where):
+    """pythonw has no console: errors would vanish, so the current exception goes to padbridge.log."""
+    import traceback
+    try:
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".old")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {where}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+
+
 def find_dualsense():
     for info in hid.enumerate(SONY_VID):
         if info["product_id"] in MODELS:
@@ -687,6 +702,22 @@ class Bridge(threading.Thread):
 
     def run(self):
         realtime_thread()
+        # Any unexpected error used to end this thread silently: the controller went dead until the
+        # app restarted. Now it's logged and the bridge starts over.
+        while not self.stopping.is_set():
+            try:
+                self._run()
+            except Exception:
+                log_error("PS5 bridge")
+                self.status = "Recovering from an error (see padbridge.log)..."
+                try:
+                    self._unplug()
+                except Exception:
+                    self.pad = None
+                self._last_report, self.state, self.buttons, self.output = None, None, 0, None
+                self.stopping.wait(1.0)
+
+    def _run(self):
         while not self.stopping.is_set():
             if self.paused.is_set():
                 self.status = "Paused - controller released for firmware update"
@@ -728,6 +759,8 @@ class Bridge(threading.Thread):
                         last_out = out
             except OSError:
                 pass
+            except Exception:
+                log_error("PS5 bridge (connected)")   # close the controller below, then reconnect
             try:
                 ds.send(0, 0, (0, 0, 0), 0, (trigger_off(), trigger_off()))
             except OSError:
@@ -1046,20 +1079,24 @@ class XboxBridge(threading.Thread):
         Normal priority on purpose: it must never take CPU time from the input thread."""
         last, idle, next_battery = None, ((0, 0), (0, 0)), 0.0
         while not done.is_set():
-            body, trig = self._effects()
-            self.body_out = body
-            cur = (body, trig)
-            # As-is mode: only our test rumble (and its stop) goes out.
-            if cur != last and (self.virtual or cur != idle or last not in (None, idle)):
-                try:
-                    self._send_rumble(slot, body, trig)
-                except OSError:
-                    pass
-            last = cur
-            if time.time() > next_battery:
-                self._update_battery(slot)
-                # until the first reading arrives (the BLE battery node is found a moment later), retry soon
-                next_battery = time.time() + (15 if self.battery is not None or self.wired else 2)
+            try:
+                body, trig = self._effects()
+                self.body_out = body
+                cur = (body, trig)
+                # As-is mode: only our test rumble (and its stop) goes out.
+                if cur != last and (self.virtual or cur != idle or last not in (None, idle)):
+                    try:
+                        self._send_rumble(slot, body, trig)
+                    except OSError:
+                        pass
+                last = cur
+                if time.time() > next_battery:
+                    self._update_battery(slot)
+                    # until the first reading arrives (the BLE battery node is found a moment later), retry soon
+                    next_battery = time.time() + (15 if self.battery is not None or self.wired else 2)
+            except Exception:   # log it and keep the rumble running
+                log_error("Xbox effects")
+                time.sleep(1.0)
             time.sleep(0.002)   # 2 ms: fine enough for a 900 rpm gun's 28 ms kicks
         try:
             xinput.set_rumble(slot, 0, 0)
@@ -1128,6 +1165,20 @@ class XboxBridge(threading.Thread):
 
     def run(self):
         realtime_thread()
+        # As in Bridge.run: an unexpected error is logged and the bridge starts over instead of dying.
+        while not self.stopping.is_set():
+            try:
+                self._run()
+            except Exception:
+                log_error("Xbox bridge")
+                self.status = "Recovering from an error (see padbridge.log)..."
+                try:
+                    self._unplug()
+                except Exception:
+                    self.pad = None
+                self.stopping.wait(1.0)
+
+    def _run(self):
         while not self.stopping.is_set():
             found = xinput.find_real_pad()
             if not found:
@@ -1141,32 +1192,37 @@ class XboxBridge(threading.Thread):
             done = threading.Event()
             fx = threading.Thread(target=self._effects_loop, args=(slot, done), daemon=True)
             fx.start()
-            virtual, last_packet = None, None
-            while not self.stopping.is_set():
-                if self.virtual != virtual:
-                    virtual, last_packet = self.virtual, None
-                    if virtual:
-                        self._plug()
-                        self.status = "Connected: Xbox controller - games get the corrected virtual copy"
-                    elif self.pad is not None:
-                        self.pad.unregister_notification()
-                        self.pad, self.xinput_slot, self.rumble, self._last_report = None, None, (0, 0), None
-                    if not virtual:
-                        self.status = "Connected: Xbox controller - games use it as is"
-                # Input path only: read -> calibrate -> virtual pad. Rumble/guns/battery live in _effects_loop.
-                got = xinput.get_state(slot)
-                if got is None:
-                    break
-                packet, g = got
-                if packet != last_packet:
-                    self._apply(self._read(g))
-                    last_packet = packet
-                # XInput has no "new input" event, so poll: ~0.7 ms period, ~3 us per check.
-                # (time.sleep is high-resolution; Event.wait would round up to the 15.6 ms system tick.)
-                time.sleep(0.0002)
-            done.set()
-            fx.join(1.0)
-            self._unplug()
+            try:
+                self._session(slot)
+            finally:   # even after an error: stop the effects thread (it closes the HID rumble) first
+                done.set()
+                fx.join(1.0)
+                self._unplug()
+
+    def _session(self, slot):
+        virtual, last_packet = None, None
+        while not self.stopping.is_set():
+            if self.virtual != virtual:
+                virtual, last_packet = self.virtual, None
+                if virtual:
+                    self._plug()
+                    self.status = "Connected: Xbox controller - games get the corrected virtual copy"
+                elif self.pad is not None:
+                    self.pad.unregister_notification()
+                    self.pad, self.xinput_slot, self.rumble, self._last_report = None, None, (0, 0), None
+                if not virtual:
+                    self.status = "Connected: Xbox controller - games use it as is"
+            # Input path only: read -> calibrate -> virtual pad. Rumble/guns/battery live in _effects_loop.
+            got = xinput.get_state(slot)
+            if got is None:
+                break
+            packet, g = got
+            if packet != last_packet:
+                self._apply(self._read(g))
+                last_packet = packet
+            # XInput has no "new input" event, so poll: ~0.7 ms period, ~3 us per check.
+            # (time.sleep is high-resolution; Event.wait would round up to the 15.6 ms system tick.)
+            time.sleep(0.0002)
 
 
 class ControllerGuard(threading.Thread):
