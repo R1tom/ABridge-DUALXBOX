@@ -31,6 +31,7 @@ import audio_devices
 import hidhide
 import processes
 import xinput
+from overlay_link import LINK, NEUTRAL as OVERLAY_NEUTRAL
 
 APP_NAME = "PadBridge"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +84,9 @@ XBOX_RUMBLE_REPORT = 0x03
 XBOX_RUMBLE_ALL = 0x0F
 XBOX_TRIGGER_HELD = 25      # 0-255 trigger value that counts as "held"
 XBOX_RUMBLE_REFRESH = 1.0   # seconds; re-send a running effect before its 2.55 s on-time runs out
+DS_OUTPUT_MIN_GAP = 0.02    # same cap for DualSense output reports over Bluetooth
+XBOX_RUMBLE_MIN_GAP = 0.02  # seconds between writes (50/s): unthrottled rumble floods the shared
+                            # Bluetooth radio in heavy scenes and makes BT speakers/headphones crackle
 
 HAPTIC_RATE = 48000
 HAPTIC_CUTOFF = 250      # Hz; the voice-coil actuators only reproduce the low end
@@ -335,9 +339,27 @@ def load_config():
     return cfg
 
 
+_save_lock = threading.Lock()
+
+
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
+    """Atomic (temp file + replace) and serialised: saves come from several threads, and a half-written
+    file (power cut, or two writers) would silently reset every setting to the defaults."""
+    with _save_lock:
+        for _ in range(3):
+            try:
+                data = json.dumps(cfg, indent=2)
+                break
+            except RuntimeError:   # another thread changed cfg mid-dump; try again
+                time.sleep(0.01)
+        else:
+            return
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
 
 
 LOG_PATH = os.path.join(APP_DIR, "padbridge.log")
@@ -351,6 +373,15 @@ def log_error(where):
             os.replace(LOG_PATH, LOG_PATH + ".old")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} {where}\n{traceback.format_exc()}\n")
+    except OSError:
+        pass
+
+
+def log_event(msg):
+    """One line in padbridge.log: controller connects/disconnects, to explain "not detected" afterwards."""
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except OSError:
         pass
 
@@ -541,6 +572,31 @@ class DualSense:
             self.dev.write(bytes(rep))
 
 
+class _RetiredPad(vg.VX360Gamepad):
+    def __del__(self):   # never vigem_target_free: ViGEmClient's notification thread may still use it
+        pass
+
+
+_retired_pads = []   # keeps retired pads (and their rumble callback thunks) alive for good
+
+
+def retire_pad(pad):
+    """Unplug a virtual pad from the bus without freeing it. vgamepad's __del__ frees the target and the
+    rumble callback at once, while ViGEmClient's notification thread can still be using both: an access
+    violation in ViGEmClient.dll (or in freed memory) when a pad is plugged and unplugged quickly, as
+    at boot before the controller connects. A few hundred bytes per unplug."""
+    try:
+        pad.unregister_notification()
+    except Exception:
+        pass
+    try:
+        vg.win.virtual_gamepad.vcli.vigem_target_remove(pad._busp, pad._devicep)
+    except Exception:
+        pass
+    pad.__class__ = _RetiredPad
+    _retired_pads.append(pad)
+
+
 class Bridge(threading.Thread):
     def __init__(self, cfg):
         super().__init__(daemon=True)
@@ -577,7 +633,7 @@ class Bridge(threading.Thread):
     def _unplug(self):
         # Removing the virtual pad means the native game sees only the real DualSense (no double input).
         if self.pad is not None:
-            self.pad.unregister_notification()
+            retire_pad(self.pad)
             self.pad = None
         self.xinput_slot, self.rumble = None, (0, 0)
 
@@ -619,8 +675,10 @@ class Bridge(threading.Thread):
         cal = self.cfg["calibration"] or DEFAULT_CAL
         sdz = self.cfg["stick_deadzone"] / 100
         tdz = self.cfg["trigger_deadzone"] / 100
-        report = (btn, map_trigger(s["l2"], cal["l2"], tdz), map_trigger(s["r2"], cal["r2"], tdz),
-                  *map_stick(s["lx"], s["ly"], cal, "l", sdz), *map_stick(s["rx"], s["ry"], cal, "r", sdz))
+        gbtn = LINK.filter(btn)  # game overlay: may hold the pad neutral or keep Guide for itself
+        report = OVERLAY_NEUTRAL if gbtn is None else (
+            gbtn, map_trigger(s["l2"], cal["l2"], tdz), map_trigger(s["r2"], cal["r2"], tdz),
+            *map_stick(s["lx"], s["ly"], cal, "l", sdz), *map_stick(s["rx"], s["ry"], cal, "r", sdz))
         self.output = report
         self.state = s
         self.buttons = btn
@@ -728,9 +786,9 @@ class Bridge(threading.Thread):
                 self.status = f"{self.native_game} is using the PS5 controller directly (its own adaptive triggers)"
                 self.stopping.wait(0.5)
                 continue
-            self._plug()
             info = find_dualsense()
             if not info:
+                self._unplug()   # no DualSense: no virtual pad either, so games don't see a phantom player 1
                 self.status = "Waiting for DualSense (USB or Bluetooth)..."
                 self.stopping.wait(1.0)
                 continue
@@ -740,9 +798,10 @@ class Bridge(threading.Thread):
                 self.status = f"Could not open controller: {e}"
                 self.stopping.wait(2.0)
                 continue
+            self._plug()
             self.status = f"Connected: {ds.name} over {'Bluetooth' if ds.bt else 'USB'}"
             self.firmware = f"Firmware {ds.update_version:04X}" + (f" ({ds.build_date})" if ds.build_date else "")
-            last_out = None
+            last_out, last_send, next_probe = None, 0.0, 0.0
             got_input = time.time()
             try:
                 while not self.stopping.is_set() and not self.paused.is_set() and not self.native_game:
@@ -750,13 +809,20 @@ class Bridge(threading.Thread):
                     if s:
                         self._apply(s)
                         got_input = time.time()
-                    elif time.time() - got_input > 3 and not find_dualsense():
-                        break  # Bluetooth drop without a read error
+                    elif time.time() - got_input > 3 and time.time() >= next_probe:
+                        next_probe = time.time() + 1.0   # enumerating is slow: once a second, not every read
+                        if not find_dualsense():
+                            break  # Bluetooth drop without a read error
                     self._fire_guns()
                     out = self.desired_output()
-                    if out != last_out:
+                    now = time.perf_counter()
+                    # Over Bluetooth, cap output reports like the Xbox rumble: a write per game frame floods
+                    # the shared radio (BT speaker crackle). Stops go out at once; a skipped change is
+                    # retried on the next read (<= 8 ms), so the latest value always lands.
+                    if out != last_out and (not ds.bt or now - last_send >= DS_OUTPUT_MIN_GAP
+                                            or not (out[0] or out[1])):
                         ds.send(*out)
-                        last_out = out
+                        last_out, last_send = out, now
             except OSError:
                 pass
             except Exception:
@@ -925,19 +991,32 @@ class XboxRumbleHID(threading.Thread):
         self.wake.set()
 
     def run(self):
-        sent = None
+        sent, last, fails = None, 0.0, 0
         while True:
             # A set() wakes this at once; the timeout only paces the keep-alive re-send.
             self.wake.wait(XBOX_RUMBLE_REFRESH)
             self.wake.clear()
+            wait = last + XBOX_RUMBLE_MIN_GAP - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)   # changes arriving meanwhile merge into the next write
             want = self.want
             if want != sent or any(want):
+                last = time.perf_counter()
                 try:
-                    if self.dev.write(bytes([XBOX_RUMBLE_REPORT, XBOX_RUMBLE_ALL, *want, 255, 0, 0])) < 0:
-                        break
+                    ok = self.dev.write(bytes([XBOX_RUMBLE_REPORT, XBOX_RUMBLE_ALL, *want, 255, 0, 0])) >= 0
                 except (OSError, ValueError):
-                    break
-                sent = want
+                    ok = False
+                if not ok:
+                    # A busy radio can time a write out; only give up (pad gone) after several in a row.
+                    fails += 1
+                    if fails >= 5 or self.closing:
+                        if not self.closing:
+                            log_event("Xbox: HID rumble writer gave up after 5 failed writes")
+                        break
+                    time.sleep(0.2)
+                    self.wake.set()   # retry the latest value
+                    continue
+                fails, sent = 0, want
             if self.closing:
                 break
         self.dev.close()
@@ -1078,18 +1157,27 @@ class XboxBridge(threading.Thread):
         loop only ever reads the controller and forwards it to the virtual pad.
         Normal priority on purpose: it must never take CPU time from the input thread."""
         last, idle, next_battery = None, ((0, 0), (0, 0)), 0.0
+        last_send, next_hid = 0.0, time.time() + 5
         while not done.is_set():
             try:
+                if self.hid_rumble is None and time.time() > next_hid:
+                    self.hid_rumble = XboxRumbleHID.open()   # the writer gave up or wasn't found at connect
+                    if self.hid_rumble is not None:
+                        log_event("Xbox: HID rumble opened late")
+                    next_hid = time.time() + 10
                 body, trig = self._effects()
                 self.body_out = body
                 cur = (body, trig)
+                now = time.perf_counter()
                 # As-is mode: only our test rumble (and its stop) goes out.
-                if cur != last and (self.virtual or cur != idle or last not in (None, idle)):
+                # The XInput fallback goes over the same radio, so it gets the same cap (stops go at once).
+                if (cur != last and (self.virtual or cur != idle or last not in (None, idle))
+                        and (now - last_send >= XBOX_RUMBLE_MIN_GAP or cur == idle)):
                     try:
                         self._send_rumble(slot, body, trig)
                     except OSError:
                         pass
-                last = cur
+                    last, last_send = cur, now
                 if time.time() > next_battery:
                     self._update_battery(slot)
                     # until the first reading arrives (the BLE battery node is found a moment later), retry soon
@@ -1123,7 +1211,7 @@ class XboxBridge(threading.Thread):
     def _unplug(self):
         # Only have a virtual pad while the real one is connected, so games don't see a phantom controller.
         if self.pad is not None:
-            self.pad.unregister_notification()
+            retire_pad(self.pad)
             self.pad = None
         self.state, self.output, self.buttons = None, None, 0
         self.xinput_slot, self.real_slot, self.battery = None, None, None
@@ -1152,8 +1240,10 @@ class XboxBridge(threading.Thread):
         cal = self.cfg["calibration"] or DEFAULT_CAL
         sdz = self.cfg["stick_deadzone"] / 100
         tdz = self.cfg["trigger_deadzone"] / 100
-        report = (s["b"], map_trigger(s["l2"], cal["l2"], tdz), map_trigger(s["r2"], cal["r2"], tdz),
-                  *map_stick(s["lx"], s["ly"], cal, "l", sdz), *map_stick(s["rx"], s["ry"], cal, "r", sdz))
+        gbtn = LINK.filter(s["b"])  # game overlay: may hold the pad neutral or keep Guide for itself
+        report = OVERLAY_NEUTRAL if gbtn is None else (
+            gbtn, map_trigger(s["l2"], cal["l2"], tdz), map_trigger(s["r2"], cal["r2"], tdz),
+            *map_stick(s["lx"], s["ly"], cal, "l", sdz), *map_stick(s["rx"], s["ry"], cal, "r", sdz))
         self.state, self.output, self.buttons = s, report, s["b"]
         self.rguard.touch(report)
         if self.pad is not None and report != self._last_report:
@@ -1179,21 +1269,35 @@ class XboxBridge(threading.Thread):
                 self.stopping.wait(1.0)
 
     def _run(self):
+        waiting_since, next_note = None, 0.0
         while not self.stopping.is_set():
             found = xinput.find_real_pad()
             if not found:
                 self._unplug()
                 self.status = "Waiting for an Xbox controller (Bluetooth, USB or adapter)..."
+                now = time.time()
+                if waiting_since is None:
+                    waiting_since = now
+                    log_event("Xbox: waiting for a controller")
+                if now >= next_note:   # what XInput and HID can see while we wait
+                    next_note = now + 30
+                    hids = [hex(d["product_id"]) for d in hid.enumerate(0x045E, 0) if d["usage_page"] == 1]
+                    log_event(f"Xbox: still waiting - XInput slots {[xinput.ids(i) for i in range(4)]}, "
+                              f"HID pads {hids}")
                 self.stopping.wait(1.0)
                 continue
-            slot, _ = found
+            waiting_since, next_note = None, 0.0
+            slot, pid = found
             self.real_slot = slot
             self.hid_rumble = XboxRumbleHID.open()
+            log_event(f"Xbox: connected pid {pid:#06x} in XInput slot {slot}, "
+                      f"HID rumble {'yes' if self.hid_rumble else 'no'}, mode {self.cfg['mode']}")
             done = threading.Event()
             fx = threading.Thread(target=self._effects_loop, args=(slot, done), daemon=True)
             fx.start()
             try:
                 self._session(slot)
+                log_event("Xbox: disconnected" if not self.stopping.is_set() else "Xbox: bridge stopped")
             finally:   # even after an error: stop the effects thread (it closes the HID rumble) first
                 done.set()
                 fx.join(1.0)
@@ -1201,14 +1305,23 @@ class XboxBridge(threading.Thread):
 
     def _session(self, slot):
         virtual, last_packet = None, None
+        next_check = 0.0
         while not self.stopping.is_set():
+            # After an off/on the real pad can come back in another slot and our virtual pad can take
+            # this one, so get_state() never fails; check 4x a second that the slot is still the real pad.
+            now = time.perf_counter()
+            if now >= next_check:
+                next_check = now + 0.25
+                found = xinput.ids(slot)
+                if found is None or found == xinput.VIRTUAL_360:
+                    break
             if self.virtual != virtual:
                 virtual, last_packet = self.virtual, None
                 if virtual:
                     self._plug()
                     self.status = "Connected: Xbox controller - games get the corrected virtual copy"
                 elif self.pad is not None:
-                    self.pad.unregister_notification()
+                    retire_pad(self.pad)
                     self.pad, self.xinput_slot, self.rumble, self._last_report = None, None, (0, 0), None
                 if not virtual:
                     self.status = "Connected: Xbox controller - games use it as is"
@@ -1273,7 +1386,7 @@ class ControllerGuard(threading.Thread):
                         self.pending = {p: h for p, h in self.pending.items() if vid not in p.upper()}
 
     def reconnect_hint(self, vid):
-        states = [h for p, h in self.pending.items() if vid in p.upper()]
+        states = [h for p, h in list(self.pending.items()) if vid in p.upper()]
         if not states:
             return ""
         return ("Turn this controller off and on (or re-plug it) once so games "
@@ -1300,6 +1413,13 @@ class GameWatcher(threading.Thread):
         while not self.stopping.is_set():
             self.wake.clear()
             try:
+                self._check()
+            except Exception:   # e.g. a game removed in the UI mid-check: log it, check again next second
+                log_error("Game watcher")
+            self.wake.wait(1.0)
+
+    def _check(self):
+            try:
                 names = processes.running_names()
             except OSError:
                 names = set()
@@ -1317,7 +1437,6 @@ class GameWatcher(threading.Thread):
                 self.haptics.suspend.set()
             else:
                 self.haptics.suspend.clear()
-            self.wake.wait(1.0)
 
 
 class AddGameDialog(tk.Toplevel):
@@ -2112,6 +2231,14 @@ class App:
 
     def _tick(self):
         visible = self.root.state() != "withdrawn"
+        try:
+            self._tick_body(visible)
+        except Exception:   # an error here used to stop the tick for good (tray Open/Quit dead)
+            log_error("UI tick")
+        # In the tray only the battery alarm and tray tooltip need updating: stay mostly idle.
+        self.root.after(50 if visible else 500, self._tick)
+
+    def _tick_body(self, visible):
         if visible:
             self.ds_view.tick(self.guard.reconnect_hint("VID_054C"))
             self.xb_view.tick(self.guard.reconnect_hint("VID_045E"))
@@ -2144,9 +2271,11 @@ class App:
             self.tray.title = tip[:127]
             self.tray_tip = tip
         while not self.commands.empty():
-            self.commands.get_nowait()()
-        # In the tray only the battery alarm and tray tooltip need updating: stay mostly idle.
-        self.root.after(50 if visible else 500, self._tick)
+            cmd = self.commands.get_nowait()
+            try:
+                cmd()
+            except Exception:
+                log_error("Tray command")
 
     def _quit(self):
         self.tray.stop()
@@ -2163,6 +2292,17 @@ class App:
 
 
 def main():
+    # A native crash (access violation in a driver/COM call) skips log_error: faulthandler still writes
+    # every thread's Python stack to padbridge_crash.log, so the faulting call can be found.
+    global _crash_file
+    try:
+        import faulthandler
+        _crash_file = open(os.path.join(APP_DIR, "padbridge_crash.log"), "a", encoding="utf-8")
+        _crash_file.write(f"--- started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        _crash_file.flush()
+        faulthandler.enable(_crash_file, all_threads=True)
+    except OSError:
+        pass
     k32 = ctypes.windll.kernel32
     k32.CreateEventW.restype = ctypes.c_void_p
     # A second launch (e.g. the desktop shortcut) signals this event so the running copy pops out of the tray.
@@ -2190,6 +2330,8 @@ def main():
     watcher = GameWatcher(cfg, bridge, haptics, xbox)
     watcher.start()
     root = tk.Tk()
+    if "--minimized" in sys.argv:
+        root.withdraw()   # before App builds the window, so it never flashes up and takes focus
     app = App(root, cfg, bridge, haptics, xbox, guard, watcher)
 
     def wait_for_show():

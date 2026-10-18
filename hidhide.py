@@ -47,6 +47,9 @@ def hidden_paths():
     return {line.split('"')[1].upper() for line in out.splitlines() if line.startswith("--dev-hide")}
 
 
+_last_args = None
+
+
 def protect(hide_xbox=True, games=(), forget=()):
     """Whitelist this app (and `games`: native-PS5 games that talk to the DualSense themselves), un-whitelist
     `forget`, hide the real controllers (Xbox pads only if hide_xbox), switch cloaking on.
@@ -69,7 +72,10 @@ def protect(hide_xbox=True, games=(), forget=()):
         args += ["--dev-hide", p]
     for p in show:
         args += ["--dev-unhide", p]
-    _run(*args, "--cloak-on")
+    global _last_args
+    if args != _last_args or hide or show:   # nothing changed: skip the re-apply (runs every 30 s)
+        _run(*args, "--cloak-on")
+        _last_args = args
     return devices, hide + show
 
 
