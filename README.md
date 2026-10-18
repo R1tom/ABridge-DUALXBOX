@@ -48,6 +48,11 @@ The input path does only three things: read the controller, apply calibration, u
 
 That's about **0.25 ms** added on average. The DualSense side is event-driven: it forwards each report as soon as it arrives.
 
+## Reliability
+- **Self-healing bridges:** if a controller bridge hits an unexpected error, the app logs it to `padbridge.log` and restarts the bridge about 1 s later. You don't need to restart the app or the PC.
+- **Turning the Xbox controller off and on** is handled. Windows can put the controller back in a different XInput slot, so the app checks 4 times a second that it's still reading the real controller and finds it again if it moved. Each check takes about 4 µs and runs outside the input path.
+- **Crash log:** a crash inside a native library (for example ViGEmClient) is written to `padbridge_crash.log`.
+
 ## Requirements
 - Windows 10/11
 - Python 3.12
@@ -67,7 +72,18 @@ Settings are saved in `config.json` next to the app, which is created on first r
 
 ## Notes
 - Windows.Gaming.Input ignores vibration from background apps, and XInput has no trigger motors. That's why the Xbox trigger effects are written as Bluetooth HID output report `0x03` (`[mask, LT, RT, strong, weak, on-time, off-time, repeat]`).
+- `overlay_link.py` is an optional link to a companion game overlay (a 16-byte shared-memory block). The overlay can hold the pad neutral while its panel is open, or keep the Guide button for itself. Without the overlay it does nothing.
 - Not affiliated with Sony or Microsoft.
+
+## Changelog
+**2026-10-18**
+- Fixed: the Xbox controller stopped working after it was turned off and on. The app kept reading its own virtual pad, and the Xbox tab showed "USB powered" instead of the battery level.
+- Fixed: a crash about 1 s after start when no DualSense was connected. Virtual pads were freed while ViGEm was still using them. They are now removed safely.
+- HidHide rules are re-applied only when something changes, not every 30 s.
+- Added the optional game-overlay link.
+
+**2026-10-15**
+- The controller bridges recover from unexpected errors on their own and log the cause to `padbridge.log`.
 
 ## License
 [MIT](LICENSE)
