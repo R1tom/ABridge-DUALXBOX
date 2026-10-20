@@ -61,6 +61,7 @@ That's about **0.25 ms** added on average. The DualSense side is event-driven: i
 - Xbox trigger motors need the controller connected over **Bluetooth**. Over USB or the Xbox Wireless Adapter you get normal rumble only.
 
 ## Install & run
+Download the zip from [Releases](https://github.com/R1tom/PadBridge/releases/latest) and unzip it, or clone the repo:
 ```bat
 git clone https://github.com/R1tom/PadBridge
 cd PadBridge
