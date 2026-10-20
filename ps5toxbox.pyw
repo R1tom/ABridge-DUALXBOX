@@ -1,4 +1,4 @@
-"""PadBridge: PS5 (DualSense) and Xbox controllers on Windows PC.
+"""ABridge DUALXBOX Configuration: PS5 (DualSense) and Xbox controllers on Windows PC.
 DualSense -> virtual Xbox 360 controller (ViGEmBus) with rumble, adaptive triggers and audio haptics;
 Xbox controller -> calibrated virtual copy with impulse-trigger effects over Bluetooth;
 per-game trigger profiles, battery alarm and battery saver."""
@@ -33,7 +33,7 @@ import processes
 import xinput
 from overlay_link import LINK, NEUTRAL as OVERLAY_NEUTRAL
 
-APP_NAME = "PadBridge"
+APP_NAME = "ABridge DUALXBOX Configuration"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 STARTUP_CMD = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup\PS5toXbox.cmd")
@@ -362,11 +362,11 @@ def save_config(cfg):
         os.replace(tmp, CONFIG_PATH)
 
 
-LOG_PATH = os.path.join(APP_DIR, "padbridge.log")
+LOG_PATH = os.path.join(APP_DIR, "abridge.log")
 
 
 def log_error(where):
-    """pythonw has no console: errors would vanish, so the current exception goes to padbridge.log."""
+    """pythonw has no console: errors would vanish, so the current exception goes to abridge.log."""
     import traceback
     try:
         if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1_000_000:
@@ -378,7 +378,7 @@ def log_error(where):
 
 
 def log_event(msg):
-    """One line in padbridge.log: controller connects/disconnects, to explain "not detected" afterwards."""
+    """One line in abridge.log: controller connects/disconnects, to explain "not detected" afterwards."""
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
@@ -767,7 +767,7 @@ class Bridge(threading.Thread):
                 self._run()
             except Exception:
                 log_error("PS5 bridge")
-                self.status = "Recovering from an error (see padbridge.log)..."
+                self.status = "Recovering from an error (see abridge.log)..."
                 try:
                     self._unplug()
                 except Exception:
@@ -1261,7 +1261,7 @@ class XboxBridge(threading.Thread):
                 self._run()
             except Exception:
                 log_error("Xbox bridge")
-                self.status = "Recovering from an error (see padbridge.log)..."
+                self.status = "Recovering from an error (see abridge.log)..."
                 try:
                     self._unplug()
                 except Exception:
@@ -2293,11 +2293,11 @@ class App:
 
 def main():
     # A native crash (access violation in a driver/COM call) skips log_error: faulthandler still writes
-    # every thread's Python stack to padbridge_crash.log, so the faulting call can be found.
+    # every thread's Python stack to abridge_crash.log, so the faulting call can be found.
     global _crash_file
     try:
         import faulthandler
-        _crash_file = open(os.path.join(APP_DIR, "padbridge_crash.log"), "a", encoding="utf-8")
+        _crash_file = open(os.path.join(APP_DIR, "abridge_crash.log"), "a", encoding="utf-8")
         _crash_file.write(f"--- started {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         _crash_file.flush()
         faulthandler.enable(_crash_file, all_threads=True)

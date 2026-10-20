@@ -1,6 +1,6 @@
-"""Shared-memory link with the RITOM's OWN LIBRARY game overlay.
+"""Shared-memory link with the KILA Local Game Library in-game overlay.
 
-16 bytes in the named mapping Local\\PuzariPadLink:
+16 bytes in the named mapping Local\\ABridgePadLink:
   0-1  buttons  (XInput bits, little endian) - written here, so the overlay can read the pad even
                 while the game is getting a neutral one
   2    hold     - set by the overlay while its panel is open: games get a neutral pad
@@ -17,7 +17,7 @@ GUIDE = 0x0400
 class Link:
     def __init__(self):
         try:
-            self.mm = mmap.mmap(-1, 16, tagname="Local\\PuzariPadLink")
+            self.mm = mmap.mmap(-1, 16, tagname="Local\\ABridgePadLink")
         except Exception:
             self.mm = None
         self.last = -1
